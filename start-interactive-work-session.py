@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import json
+import requests
 import subprocess
 from datetime import datetime, timedelta
 
@@ -120,5 +122,81 @@ def test_reservation_walltime():
     with pytest.raises(ValueError):
         oar_walltime(dt, dt-timedelta(seconds=1))
 
+def do_g5k_cluster_status_request(site: str, cluster: str, url: str='https://api.grid5000.fr/stable', nodes=True, waiting=True, job_details=True, disks=False) -> dict:
+    headers = {"accept": "application/vnd.grid5000.item+json"}
+    bool_to_str = {
+        True: 'yes',
+        False: 'no',
+    }
+
+    fields = {
+        'disks': disks,
+        'nodes': nodes,
+        'waiting': waiting,
+        'job_details': job_details
+    }
+    fields_str = '&'.join(f"{x}:{bool_to_str[y]}" for x,y in fields.items())
+
+    full_url = f"{url}/sites/{site}/clusters/{cluster}/status"
+
+    response = requests.get(full_url, data=fields_str, headers=headers)
+    if not response.ok:
+        response.raise_for_status()
+    return json.loads(response.text)
+
+def natural_sort(l):
+    convert = lambda text: int(text) if text.isdigit() else text.lower()
+    alphanum_key = lambda key: [convert(c) for c in re.split('([0-9]+)', key)]
+    return sorted(l, key=alphanum_key)
+
+def get_usable_nodes(site: str, cluster: str, target_dt: datetime):
+    response = do_g5k_cluster_status_request(site, cluster)
+    nodes = response['nodes']
+
+    def node_usable(node: dict) -> bool:
+        if node['soft'] != 'free':
+            return False
+        if len(node['reservations']) > 0:
+            first_reservation_start_timestamp = min([int(r['scheduled_at']) for r in node['reservations']])
+            first_reservation_start_dt = datetime.fromtimestamp(first_reservation_start_timestamp)
+            if first_reservation_start_dt < target_dt:
+                return False
+        return True
+
+    return {name:node for name,node in nodes.items() if node_usable(node)}
+
+
+def select_cluster_first_fit(preferred_clusters: list[tuple[str, str]], target_dt: datetime):
+    for cluster, site in preferred_clusters:
+        nodes = get_usable_nodes(site, cluster, target_dt)
+        if len(nodes) > 0 :
+            return (cluster, site)
+    raise RuntimeError(f'No cluster with available nodes in the given cluster list {[x[0] for x in preferred_clusters]}')
+
+def reserve_job(site: str, cluster: str, target_dt: datetime, url: str='https://api.grid5000.fr/stable'):
+    wt = oar_walltime(datetime.now(), target_dt)
+
+    headers = {"Content-Type": "application/json"}
+    fields = {
+        'command': '~/interactive/setup.sh ; sleep 987654321',
+        'properties': f"(cluster='{cluster}')",
+        'resources': f'nodes=1,walltime={wt}',
+    }
+    full_url = f"{url}/sites/{site}/jobs"
+
+    response = requests.post(full_url, data=json.dumps(fields), headers=headers)
+    if not response.ok:
+        response.raise_for_status()
+    return json.loads(response.text)
+
 if __name__ == '__main__':
-    print(oarsub_command())
+    target_dt = end_of_reservation(datetime.now())
+
+    my_cluster_preference = [
+        ('dahu', 'grenoble'),
+        ('gros', 'nancy')
+    ]
+
+    (cluster, site) = select_cluster_first_fit(my_cluster_preference, target_dt)
+    response_dict = reserve_job(site, cluster, target_dt, url='https://api.grid5000.fr/stable')
+    print(f'job {response_dict["uid"]} has been reserved on {site}/{cluster}')
