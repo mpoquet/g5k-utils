@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
+import argparse
 import json
+import os
 import requests
 import subprocess
+import sys
+import time
+
 from datetime import datetime, timedelta
 
 def hostname():
@@ -173,30 +178,122 @@ def select_cluster_first_fit(preferred_clusters: list[tuple[str, str]], target_d
             return (cluster, site)
     raise RuntimeError(f'No cluster with available nodes in the given cluster list {[x[0] for x in preferred_clusters]}')
 
-def reserve_job(site: str, cluster: str, target_dt: datetime, url: str='https://api.grid5000.fr/stable'):
+def reserve_job(site: str, cluster: str, target_dt: datetime, cmd: str, log_prefix: str, url: str='https://api.grid5000.fr/stable'):
     wt = oar_walltime(datetime.now(), target_dt)
 
     headers = {"Content-Type": "application/json"}
     fields = {
-        'command': '~/interactive/setup.sh ; sleep 987654321',
+        'command': cmd,
         'properties': f"(cluster='{cluster}')",
         'resources': f'nodes=1,walltime={wt}',
+        'stdout': f'{log_prefix}.stdout',
+        'stderr': f'{log_prefix}.stderr',
+        'types': ['exotic'],
     }
     full_url = f"{url}/sites/{site}/jobs"
 
     response = requests.post(full_url, data=json.dumps(fields), headers=headers)
     if not response.ok:
+        print(response.text)
         response.raise_for_status()
     return json.loads(response.text)
 
-if __name__ == '__main__':
+def get_job_info(job_id: str, site: str, url: str='https://api.grid5000.fr/stable'):
+    full_url = f"{url}/sites/{site}/jobs/{job_id}"
+
+    response = requests.get(full_url)
+    if not response.ok:
+        print(response.text)
+        response.raise_for_status()
+    return json.loads(response.text)
+
+def wait_for_job_to_start(job_id: str, site: str, sleep_duration: int=5, url: str='https://api.grid5000.fr/stable'):
+    print(f'Waiting for job {job_id} to start on site {site}')
+    while True:
+        info = get_job_info(job_id, site, url)
+        job_state = info['state'].lower()
+
+        if job_state not in ['waiting', 'launching']:
+            print(f"  state is '{job_state}' -> it has started")
+            return info
+        print(f"  state is '{job_state}' -> sleeping for {sleep_duration} seconds")
+        time.sleep(sleep_duration)
+
+def wait_for_setup_to_finish(job_id: str, site: str, log_prefix: str, sleep_duration: int=10, url: str='https://api.grid5000.fr/stable'):
+    print(f'Waiting for interactive setup of job {job_id} on site {site} to finish')
+    while True:
+        job_current_stdout = open(f'{log_prefix}.stdout', 'r', encoding='utf-8').read()
+
+        if 'Setup has run successfully' in job_current_stdout:
+            print(f'  done')
+            return True
+        if 'Setup has run UNsuccessfully' in job_current_stdout:
+            print(f'  finished but failed :(')
+            return False
+
+        # checking whether the job is still running
+        info = get_job_info(job_id, site, url)
+        job_state = info['state'].lower()
+        if job_state != 'running':
+            print(f'  job state is not running anymore (state={job_state}) -> aborting')
+            raise RuntimeError('aborting wait for interactive setup to finish beacause the job is not running anymore')
+
+        print(f'  setup is ongoing -> sleeping for {sleep_duration} seconds')
+        time.sleep(sleep_duration)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--clear-log-files', action='store_true')
+    parser.add_argument('--clear-subscript', action='store_true')
+    parser.add_argument('--wait-job-running', action='store_true')
+    parser.add_argument('--wait-job-setup-finished', action='store_true')
+    args = parser.parse_args()
+
+    if args.wait_job_setup_finished:
+        assert(args.clear_log_files)
+
+    user = os.environ['USER']
+    cmd = f'/home/{user}/interactive/job-script.sh'
+    log_prefix = f'/home/{user}/OAR.interactive'
+
+    if args.clear_log_files:
+        log_files = [f'{log_prefix}.stdout', f'{log_prefix}.stderr']
+        print(f'Removing log files {log_files}')
+        for filename in log_files:
+            try:
+                os.remove(filename)
+            except OSError:
+                pass
+
     target_dt = end_of_reservation(datetime.now())
 
     my_cluster_preference = [
         ('dahu', 'grenoble'),
-        ('gros', 'nancy')
+        #('troll', 'grenoble'),
+        #('yeti', 'grenoble'),
+        #('gros', 'nancy'),
     ]
 
     (cluster, site) = select_cluster_first_fit(my_cluster_preference, target_dt)
-    response_dict = reserve_job(site, cluster, target_dt, url='https://api.grid5000.fr/stable')
-    print(f'job {response_dict["uid"]} has been reserved on {site}/{cluster}')
+    response_dict = reserve_job(site, cluster, target_dt, cmd, log_prefix, url='https://api.grid5000.fr/stable')
+
+    job_id = response_dict["uid"]
+    subscript_path = response_dict['directory'] + '/' + response_dict['command']
+    print(f'job {job_id} has been reserved on {site}/{cluster} ; will call {subscript_path}')
+
+    if args.wait_job_running or args.clear_subscript or args.wait_job_setup_finished:
+        wait_for_job_to_start(job_id, site)
+
+    if args.clear_subscript:
+        print(f'Removing subscript file {subscript_path}')
+        try:
+            os.remove(subscript_path)
+        except OSError:
+            print('  could not remove file (this is normal if job is not run on this site)')
+            sys.exit(1)
+
+    if args.wait_job_setup_finished:
+        wait_for_setup_to_finish(job_id, site, log_prefix)
+
+if __name__ == '__main__':
+    main()
