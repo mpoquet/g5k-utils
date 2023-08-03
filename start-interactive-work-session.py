@@ -2,34 +2,14 @@
 import argparse
 import json
 import os
+import re
 import requests
+import socket
 import subprocess
 import sys
 import time
 
 from datetime import datetime, timedelta
-
-def hostname():
-    p = subprocess.run('hostname', stdout=subprocess.PIPE, encoding='utf-8')
-    return p.stdout.strip()
-
-def oarsub_command(nb_host=1) -> str:
-    frontend_to_cluster = {
-        'fgrenoble': 'dahu',
-        'fnancy': 'gros',
-    }
-
-    host = hostname()
-    cluster_selection = ''
-    if host not in frontend_to_cluster:
-        raise RuntimeError(f'Please specify which cluster to use from host {host}')
-    cluster = frontend_to_cluster[host]
-
-    start_dt = datetime.now()
-    end_dt = end_of_reservation(start_dt)
-    walltime_str = oar_walltime(start_dt, end_dt)
-
-    return f'''oarsub -I -l {{"cluster='{cluster}'}}"/host={nb_host},walltime={walltime_str}'''
 
 def end_of_reservation(start_dt: datetime, delta_before_end: timedelta=timedelta(minutes=5)) -> datetime:
     overnight_delta = timedelta()
@@ -68,6 +48,15 @@ def oar_walltime(start_dt: datetime, target_dt: datetime) -> str:
     delta_seconds = delta_seconds % 60
 
     return f"{hours:02d}:{minutes:02d}:{delta_seconds:02d}"
+
+RE_LOCAL_SITE = re.compile('^f(\w+)$')
+
+def determine_local_site():
+    hostname = socket.gethostname()
+    m = RE_LOCAL_SITE.match(hostname)
+    if m is None:
+        raise RuntimeError(f"Could not extract site name from hostname='{hostname}'. Are you on a Grid'5000 frontend?")
+    return m.group(1)
 
 def test_reservation_walltime():
     import pytest
@@ -188,9 +177,13 @@ def reserve_job(site: str, cluster: str, target_dt: datetime, cmd: str, log_pref
         'resources': f'nodes=1,walltime={wt}',
         'stdout': f'{log_prefix}.stdout',
         'stderr': f'{log_prefix}.stderr',
-        'types': ['exotic'],
+        'types': [],
     }
     full_url = f"{url}/sites/{site}/jobs"
+
+    # temporary hack
+    if cluster == 'montcalm':
+        fields['queue'] = 'testing'
 
     response = requests.post(full_url, data=json.dumps(fields), headers=headers)
     if not response.ok:
@@ -207,7 +200,7 @@ def get_job_info(job_id: str, site: str, url: str='https://api.grid5000.fr/stabl
         response.raise_for_status()
     return json.loads(response.text)
 
-def wait_for_job_to_start(job_id: str, site: str, sleep_duration: int=5, url: str='https://api.grid5000.fr/stable'):
+def wait_for_job_to_start(job_id: str, site: str, sleep_duration: int=10, url: str='https://api.grid5000.fr/stable'):
     print(f'Waiting for job {job_id} to start on site {site}')
     while True:
         info = get_job_info(job_id, site, url)
@@ -267,14 +260,16 @@ def main():
 
     target_dt = end_of_reservation(datetime.now())
 
-    my_cluster_preference = [
-        ('dahu', 'grenoble'),
-        #('troll', 'grenoble'),
-        #('yeti', 'grenoble'),
-        #('gros', 'nancy'),
-    ]
+    cluster_preference_per_site = {
+        'grenoble': ['dahu'],
+        'nancy': ['gros'],
+        'toulouse': ['montcalm'],
+    }
 
-    (cluster, site) = select_cluster_first_fit(my_cluster_preference, target_dt)
+    local_site = determine_local_site()
+    cluster_preference = [(cluster, local_site) for cluster in cluster_preference_per_site[local_site]]
+
+    (cluster, site) = select_cluster_first_fit(cluster_preference, target_dt)
     response_dict = reserve_job(site, cluster, target_dt, cmd, log_prefix, url='https://api.grid5000.fr/stable')
 
     job_id = response_dict["uid"]
@@ -285,6 +280,7 @@ def main():
         wait_for_job_to_start(job_id, site)
 
     if args.clear_subscript:
+        time.sleep(10)
         print(f'Removing subscript file {subscript_path}')
         try:
             os.remove(subscript_path)
